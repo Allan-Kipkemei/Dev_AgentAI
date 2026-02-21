@@ -1,85 +1,105 @@
 import json
 import os
-from typing import Any, Dict, List
+import time
+from typing import Any
 
 from pydantic import ValidationError
 
-from utils import require_env
 from review import ReviewOutput
+from utils import require_env
+
+_MAX_BODY_CHARS = 6_000
+_MAX_FILES_CHARS = 40_000
+_MAX_RETRIES = 3
+_RETRY_DELAY = 2.0
 
 
-def call_llm_review(
-    pr: Dict[str, Any],
-    file_summaries: List[Dict[str, Any]],
-    allowed_files: List[str],
-    model: str,
-) -> ReviewOutput:
-    """
-    Calls OpenAI chat completions and returns validated ReviewOutput.
-    """
-    require_env("OPENAI_API_KEY")
-
-    from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
+def _build_payload(
+    pr: dict[str, Any],
+    file_summaries: list[dict[str, Any]],
+    allowed_files: list[str],
+) -> dict[str, Any]:
     pr_title = pr.get("title", "")
-    pr_body = pr.get("body") or ""
+    pr_body = (pr.get("body") or "")[:_MAX_BODY_CHARS]
     base = pr.get("base", {}).get("ref", "")
     head = pr.get("head", {}).get("ref", "")
 
-    system = (
-        "You are a senior software engineer doing a careful GitHub pull request review.\n"
-        "Hard rules:\n"
-        "- Only mention files listed in allowed_files.\n"
-        "- If patch chunks are missing for a file, say you need context and avoid guessing.\n"
-        "- Prefer concrete, actionable feedback tied to the diff.\n"
-        "- Output MUST be valid JSON and MUST match the schema exactly.\n"
-        "- Do NOT include markdown, code fences, or extra commentary.\n"
-    )
+    # Serialize files, then truncate to a char budget to avoid blowing the context window.
+    files_json = json.dumps(file_summaries)
+    if len(files_json) > _MAX_FILES_CHARS:
+        files_json = files_json[:_MAX_FILES_CHARS] + "... [truncated]"
 
-    payload = {
-        "task": "Review this PR. Identify blocking issues, non-blocking improvements, and tests to add.",
-        "pr": {
-            "title": pr_title,
-            "body": pr_body[:6000],
-            "base": base,
-            "head": head,
-        },
+    return {
+        "task": (
+            "Review this PR. Identify blocking issues, "
+            "non-blocking improvements, and tests to add."
+        ),
+        "pr": {"title": pr_title, "body": pr_body, "base": base, "head": head},
         "allowed_files": allowed_files,
-        "files": file_summaries,
-        "schema": {
-            "summary": "string",
-            "risk_level": "low|medium|high",
-            "blocking_issues": [{"file": "path", "line": 123, "issue": "string", "fix": "string(optional)"}],
-            "non_blocking": [{"file": "path", "line": 123, "issue": "string", "fix": "string(optional)"}],
-            "tests_to_add": [{"package": "string(optional)", "test_name": "string", "reason": "string"}],
-        },
+        "files": files_json,
+        "output_schema": ReviewOutput.model_json_schema(),
         "review_style": [
             "Call out real bugs, edge cases, security risks, and correctness issues.",
             "Avoid generic advice unless tied to a specific diff chunk.",
             "Be specific about tests: what behavior to test and why.",
+            "Only mention files in allowed_files.",
+            "If patch chunks are missing for a file, say you need context — do not guess.",
         ],
     }
 
-    resp = client.chat.completions.create(
-        model=model,
-        temperature=0.2,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(payload)},
-        ],
-    )
 
-    content = (resp.choices[0].message.content or "").strip()
+_SYSTEM = (
+    "You are a senior software engineer performing a careful GitHub pull request review.\n"
+    "Your response MUST be a single valid JSON object that conforms exactly to the "
+    "provided output_schema. No markdown, no code fences, no extra keys, no commentary."
+)
 
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Model did not return valid JSON: {e}\n\nRaw:\n{content}")
 
-    try:
-        review = ReviewOutput.model_validate(data)
-    except ValidationError as e:
-        raise RuntimeError(f"Model JSON did not match schema:\n{e}\n\nRaw:\n{content}")
+def call_llm_review(
+    pr: dict[str, Any],
+    file_summaries: list[dict[str, Any]],
+    allowed_files: list[str],
+    model: str,
+) -> ReviewOutput:
+    """Call OpenAI chat completions and return a validated ReviewOutput."""
+    require_env("OPENAI_API_KEY")
 
-    return review
+    from openai import OpenAI  # local import keeps startup fast if module unused
+
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    payload = _build_payload(pr, file_summaries, allowed_files)
+
+    last_error: Exception | None = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                temperature=0.2,
+                response_format={"type": "json_object"},  # guarantees valid JSON
+                messages=[
+                    {"role": "system", "content": _SYSTEM},
+                    {"role": "user", "content": json.dumps(payload)},
+                ],
+            )
+            content = (resp.choices[0].message.content or "").strip()
+            data = json.loads(content)
+            return ReviewOutput.model_validate(data)
+
+        except json.JSONDecodeError as e:
+            last_error = RuntimeError(
+                f"[attempt {attempt}] Model did not return valid JSON: {e}\n\nRaw:\n{content}"
+            )
+        except ValidationError as e:
+            formatted = json.dumps(e.errors(), indent=2)
+            last_error = RuntimeError(
+                f"[attempt {attempt}] Model JSON did not match schema:\n{formatted}"
+            )
+        except Exception as e:
+            last_error = e
+
+        if attempt < _MAX_RETRIES:
+            time.sleep(_RETRY_DELAY * attempt)
+
+    raise RuntimeError(
+        f"LLM review failed after {_MAX_RETRIES} attempts."
+    ) from last_error
